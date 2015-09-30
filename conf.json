@@ -1,0 +1,21 @@
+{
+  "relations": ["concept:writerwrotebook", "concept:competeswith",
+    "concept:citylocatedingeopoliticallocation"],
+  "log directory": "debug_output/",
+  "features": {
+    "type": "subgraphs",
+    "path finder": {
+      "type": "BfsPathFinder",
+      "number of steps": 2
+    },
+    "feature extractors": [
+      "PraFeatureExtractor",
+      "AnyRelFeatureExtractor"
+    ],
+    "feature size": -1
+  },
+  "learning": {
+    "l1 weight": 0.005,
+    "l2 weight": 1
+  }
+}

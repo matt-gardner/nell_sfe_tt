@@ -1,0 +1,7 @@
+*.swp
+.classpath
+.project
+.settings/
+target/
+out.tcf
+debug_output/
