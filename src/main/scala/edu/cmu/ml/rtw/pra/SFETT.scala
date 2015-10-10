@@ -1,8 +1,6 @@
 package edu.cmu.ml.rtw.pra
 
-import edu.cmu.ml.rtw.pra.config.JsonHelper
 import edu.cmu.ml.rtw.pra.config.PraConfigBuilder
-import edu.cmu.ml.rtw.pra.config.SpecFileReader
 import edu.cmu.ml.rtw.pra.experiments.Dataset
 import edu.cmu.ml.rtw.pra.experiments.Instance
 import edu.cmu.ml.rtw.pra.experiments.Outputter
@@ -13,18 +11,24 @@ import edu.cmu.ml.rtw.pra.graphs.GraphInMemory
 import edu.cmu.ml.rtw.pra.graphs.PprNegativeExampleSelector
 import edu.cmu.ml.rtw.pra.models.PraModelCreator
 import edu.cmu.ml.rtw.users.matt.util.FileUtil
+import edu.cmu.ml.rtw.users.matt.util.JsonHelper
+import edu.cmu.ml.rtw.users.matt.util.SpecFileReader
 
 import edu.cmu.ml.rtw.tinkertoy.TinkerToy
 import edu.cmu.ml.rtw.tinkertoy.TinkerToyServices
 
 import scala.collection.mutable
 import scala.collection.JavaConverters._
+import scala.util.Random
 
 import edu.cmu.ml.rtw.kb.KbManipulation
 import edu.cmu.ml.rtw.kb.KbUtility
 import edu.cmu.ml.rtw.kb.RTWValue
+import edu.cmu.ml.rtw.shantytoy.TraditionalPredicateConsumer
+import edu.cmu.ml.rtw.shantytoy.{SimpleInstance => ShantyToyInstance}
 
 import org.json4s._
+import org.json4s.JsonDSL._
 
 object SFETT extends TinkerToy {
   var params: JValue = null
@@ -47,15 +51,18 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
   println(params)
 
   implicit val formats = DefaultFormats
+  val random = new Random
 
   // SFE parameters
   val featureParams: JValue = params \ "features"
   val modelParams: JValue = params \ "learning"
+  val maxTrainingInstances = JsonHelper.extractWithDefault(params, "max training instances", 5000)
+  val maxPredictionInstances = JsonHelper.extractWithDefault(params, "max prediction instances", 1000)
 
   // Parameters for getting target relations from the KB
   val populateFilter = JsonHelper.extractWithDefault(params, "populate filter", true)
-  val excludedRelations = JsonHelper.extractWithDefault(params, "relations exclude",
-    Seq("latitudelongitude")).toSet
+  val excludedRelations = JsonHelper.extractWithDefault(params, "relations to exclude",
+    Seq("concept:latitudelongitude")).toSet
   val targetRelations: Seq[RTWValue] = (params \ "relations") match {
     case relationsArray: JArray => {
       println(s"Found list of relations")
@@ -78,6 +85,14 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
   def run() {
     println("Running NellSfeInterfacer")
 
+    // Setting up the thing that will produce the proper NELL output.
+    val tpc = new TraditionalPredicateConsumer()
+    val properties = tts.getProperties()
+    properties.setProperty("topK", Integer.valueOf(1000))
+    properties.setProperty("revisedScoresFree", true)
+    properties.setProperty("filterDerogatoryScores", true)
+    tpc.initializeConsumer(tts, properties)
+
     // Base config stuff, for things that are consistent across relations, like the graph and the
     // inverse mapping.
     val baseBuilder = new PraConfigBuilder()
@@ -90,44 +105,60 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
     val baseConfig = baseBuilder.setNoChecks().build()
 
     // Now actually set up and run SFE for each target relation.
-    targetRelations.par.foreach(relation => {
-    //targetRelations.foreach(relation => {
+    //targetRelations.par.foreach(relation => {
+    targetRelations.foreach(relation => {
       println(s"Running relation $relation")
       val trainingData = loadTrainingData(
         relation, graph, relationInstances, categoryInstances, domains, ranges)
-      val testingData = generateTestData(
-        relation, graph, relationInstances, categoryInstances, domains, ranges)
+      println(s"Training data size: ${trainingData.instances.size}")
+      if (trainingData.instances.size > 0) {
+        val testingData = generateTestData(
+          relation, graph, relationInstances, categoryInstances, domains, ranges)
+        println(s"Testing data size: ${testingData.instances.size}")
 
-      // Relation-specific config stuff.
-      val builder = new PraConfigBuilder(baseConfig)
-      builder.setRelation(relation.asString())
-      builder.setOutputBase(logDir + relation.asString() + "/")
-      val relationIndex = graph.getEdgeIndex(relation.asString())
-      val inverseIndex = inverses.getOrElse(relationIndex, -1)
-      val unallowedEdges = if (inverseIndex == -1) Seq(relationIndex) else Seq(relationIndex, inverseIndex)
-      builder.setUnallowedEdges(unallowedEdges)
-      builder.setTrainingData(trainingData)
-      builder.setTestingData(testingData)
-      val config = builder.build()
-      fileUtil.mkdirs(config.outputBase)
+        // Relation-specific config stuff.
+        val builder = new PraConfigBuilder(baseConfig)
+        builder.setRelation(relation.asString())
+        builder.setOutputBase(logDir + relation.asString() + "/")
+        val relationIndex = graph.getEdgeIndex(relation.asString())
+        val inverseIndex = inverses.getOrElse(relationIndex, -1)
+        val unallowedEdges = if (inverseIndex == -1) Seq(relationIndex) else Seq(relationIndex, inverseIndex)
+        builder.setUnallowedEdges(unallowedEdges)
+        builder.setTrainingData(trainingData)
+        builder.setTestingData(testingData)
+        val config = builder.build()
+        fileUtil.mkdirs(config.outputBase)
 
-      // Now we run the SFE code.
+        // Now we run the SFE code.
 
-      // The second parameter here is praBase, which we're not using (hopefully passing /dev/null works...)
-      val generator = new SubgraphFeatureGenerator(featureParams, logDir, config)
-      val trainingMatrix = generator.createTrainingMatrix(trainingData)
+        // The second parameter here is praBase, which we're not using (hopefully passing /dev/null works...)
+        val generator = new SubgraphFeatureGenerator(featureParams, logDir, config)
+        val trainingMatrix = generator.createTrainingMatrix(trainingData)
 
-      val model = PraModelCreator.create(config, modelParams)
-      val featureNames = generator.getFeatureNames()
-      model.train(trainingMatrix, trainingData, featureNames)
+        val model = PraModelCreator.create(config, modelParams)
+        val featureNames = generator.getFeatureNames()
+        model.train(trainingMatrix, trainingData, featureNames)
 
-      println(s"Scoring ${config.testingData.instances.size} potential predictions")
-      val testMatrix = generator.createTestMatrix(config.testingData)
-      val scores = model.classifyInstances(testMatrix)
+        println(s"Scoring ${config.testingData.instances.size} potential predictions")
+        val testMatrix = generator.createTestMatrix(config.testingData)
+        val scores = model.classifyInstances(testMatrix)
 
-      // And here we output the predictions in the format that NELL expects.
-      outputPredictions(relation, scores)
+        // And here we output the predictions in the format that NELL expects.  Well, we send them to
+        // the TraditionalPredicateConsumer, which keeps track of them.
+        outputPredictions(relation, scores, tpc)
+        // I think I can put this call in multiple times and it won't overwrite anything.  We'll
+        // see...
+        tpc.writeTCF()
+      } else {
+        // Sometimes I really do wish that scala had a continue...  This should just be a continue
+        // up by the original if.
+        println("No training data found, so we're skipping this relation")
+      }
     })
+
+    // Now that we have output from all of the relations, we create a final NELL TCF file.
+    println("Outputting final NELL TCF file")
+    tpc.writeTCF()
     println("Done running NellSfeInterfacer")
   }
 
@@ -183,6 +214,7 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
 
   def loadGraphFromKb(): (GraphInMemory, Map[RTWValue, Seq[Instance]], Map[RTWValue, Set[Int]]) = {
     println("Building graph")
+    val start = compat.Platform.currentTime
     val builder = new GraphBuilder
     // NOTE(matt): I based this method off of the old PRATT code, specifically
     // PRAGraph.addPromotedBeliefs.  That code had a bunch of stuff for Ni's PRA implementation
@@ -237,19 +269,21 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
       }
     }
 
-    println("Done building graph")
+    val end = compat.Platform.currentTime
+    val seconds = (end - start) / 1000.0
+    println(s"Done building graph; took $seconds seconds")
     println(s"Graph has ${builder.edgesAdded} edges all together")
     val graph = builder.toGraphInMemory
     val categoryInstances = mutableCategoryInstances.map(entry => {
       (entry._1, entry._2.map(entityName => graph.getNodeIndex(entityName)).toSet)
-    }).toMap
+    }).withDefaultValue(Set[Int]()).toMap
     val relationInstances = mutableRelationInstances.map(entry => {
       (entry._1, entry._2.map(pair => {
         val arg1Index = graph.getNodeIndex(pair._1)
         val arg2Index = graph.getNodeIndex(pair._2)
         new Instance(arg1Index, arg2Index, true, graph)  // true here means this is a positive instance
       }).toSeq)
-    }).toMap
+    }).withDefaultValue(Seq[Instance]()).toMap
     (graph, relationInstances, categoryInstances)
   }
 
@@ -286,9 +320,14 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
       categoryInstances: Map[RTWValue, Set[Int]],
       domains: Map[RTWValue, RTWValue],
       ranges: Map[RTWValue, RTWValue]): Dataset = {
-    // NOTE(matt): we may need to downsample here, if it turns out that using all of the training
-    // data is too expensive.  Let's check running times on a real KB first, though.
-    val positiveDataset = new Dataset(relationInstances(relation))
+    // Note that we're downsampling here, because there may be too many training instances.  There
+    // might be a better way to downsample, e.g., being sure to select seed instances, or using the
+    // most confident instances.
+    if (!relationInstances.contains(relation)) {
+      println(s"Found no training instances for relation ${relation}!  Returning an empty dataset")
+      return new Dataset(Seq())
+    }
+    val positiveDataset = new Dataset(random.shuffle(relationInstances(relation)).take(maxTrainingInstances))
     val allowedSources = categoryInstances(domains(relation))
     val allowedTargets = categoryInstances(ranges(relation))
 
@@ -307,18 +346,45 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
       categoryInstances: Map[RTWValue, Set[Int]],
       domains: Map[RTWValue, RTWValue],
       ranges: Map[RTWValue, RTWValue]): Dataset = {
+    if (!relationInstances.contains(relation)) {
+      println(s"Found no positive instances for relation ${relation}; skipping test data generation")
+      return new Dataset(Seq())
+    }
     val knownPositives = new Dataset(relationInstances(relation))
     val domain = categoryInstances(domains(relation))
     val range = categoryInstances(ranges(relation))
     // We'll stick with the default arguments to the negative example selector for now; they are
     // reasonable.
-    val negativeExampleSelector = new PprNegativeExampleSelector(JNothing, graph)
+    val params: JValue = ("ppr computer" -> ("walks per source" -> 100))
+    val negativeExampleSelector = new PprNegativeExampleSelector(params, graph)
     negativeExampleSelector.findPotentialPredictions(domain, range, knownPositives)
   }
 
-  def outputPredictions(relation: RTWValue, scores: Seq[(Instance, Double)]) {
-    val topTen = scores.sortBy(pair => -pair._2).take(10)
-    println(s"Top ten prediction for relation ${relation.asString()}:")
+  def outputPredictions(relation: RTWValue, scores: Seq[(Instance, Double)], tpc: TraditionalPredicateConsumer) {
+    printTopScores(relation.asString(), scores, 10)
+    scores.foreach(instanceScore => {
+      val instance = instanceScore._1
+      val prob = sigmoid(instanceScore._2)
+      val arg1 = instance.graph.getNodeName(instance.source)
+      val arg2 = instance.graph.getNodeName(instance.target)
+      val shantyToyInstance = new ShantyToyInstance()
+      shantyToyInstance.setCompoundProvenance("TODO")
+      shantyToyInstance.setPredicate(relation)
+      shantyToyInstance.setScore(prob)
+      shantyToyInstance.setEnt1(KbManipulation.gpe(arg1))
+      shantyToyInstance.setEnt2(KbManipulation.gpe(arg2))
+      tpc.consumeInstance(shantyToyInstance)
+    })
+  }
+
+  def sigmoid(x: Double): Double = {
+    val exponent = Math.exp(-x)
+    1 / (1 + exponent)
+  }
+
+  def printTopScores(relation: String, scores: Seq[(Instance, Double)], numToPrint: Int) {
+    val topTen = scores.sortBy(pair => -pair._2).take(numToPrint)
+    println(s"Top $numToPrint prediction for relation $relation:")
     for (prediction <- topTen) {
       val instance = prediction._1
       val score = prediction._2
@@ -326,6 +392,5 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
       val arg2Name = instance.graph.getNodeName(instance.target)
       println(s"   $arg1Name, $arg2Name, $score")
     }
-    // TODO(matt): figure out what goes here
   }
 }
