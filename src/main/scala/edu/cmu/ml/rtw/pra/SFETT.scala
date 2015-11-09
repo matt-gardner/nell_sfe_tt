@@ -1,5 +1,6 @@
 package edu.cmu.ml.rtw.pra
 
+import edu.cmu.ml.rtw.pra.config.PraConfig
 import edu.cmu.ml.rtw.pra.config.PraConfigBuilder
 import edu.cmu.ml.rtw.pra.experiments.Dataset
 import edu.cmu.ml.rtw.pra.experiments.Instance
@@ -9,7 +10,7 @@ import edu.cmu.ml.rtw.pra.graphs.Graph
 import edu.cmu.ml.rtw.pra.graphs.GraphBuilder
 import edu.cmu.ml.rtw.pra.graphs.GraphInMemory
 import edu.cmu.ml.rtw.pra.graphs.PprNegativeExampleSelector
-import edu.cmu.ml.rtw.pra.models.PraModelCreator
+import edu.cmu.ml.rtw.pra.models.BatchModel
 import edu.cmu.ml.rtw.users.matt.util.FileUtil
 import edu.cmu.ml.rtw.users.matt.util.JsonHelper
 import edu.cmu.ml.rtw.users.matt.util.SpecFileReader
@@ -48,8 +49,6 @@ object SFETT extends TinkerToy {
 }
 
 class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUtil = new FileUtil) {
-  println(params)
-
   implicit val formats = DefaultFormats
   val random = new Random
 
@@ -58,6 +57,7 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
   val modelParams: JValue = params \ "learning"
   val maxTrainingInstances = JsonHelper.extractWithDefault(params, "max training instances", 5000)
   val maxPredictionInstances = JsonHelper.extractWithDefault(params, "max prediction instances", 1000)
+  val svoFile = JsonHelper.extractWithDefault(params, "svo file", null: String)
 
   // Parameters for getting target relations from the KB
   val populateFilter = JsonHelper.extractWithDefault(params, "populate filter", true)
@@ -75,6 +75,8 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
     case _ => throw new RuntimeException("relations parameter unrecognized")
   }
   println(s"Found ${targetRelations.size} relations")
+  val aliasEdge = "@ALIAS@"
+  val excludedAliases = JsonHelper.extractWithDefault(params, "aliases to exclude", Seq[String]()).toSet
 
   val logDir = (params \ "log directory") match {
     case JNothing => null
@@ -106,60 +108,92 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
 
     // Now actually set up and run SFE for each target relation.
     //targetRelations.par.foreach(relation => {
-    targetRelations.foreach(relation => {
-      println(s"Running relation $relation")
-      val trainingData = loadTrainingData(
-        relation, graph, relationInstances, categoryInstances, domains, ranges)
-      println(s"Training data size: ${trainingData.instances.size}")
-      if (trainingData.instances.size > 0) {
-        val testingData = generateTestData(
-          relation, graph, relationInstances, categoryInstances, domains, ranges)
-        println(s"Testing data size: ${testingData.instances.size}")
-
-        // Relation-specific config stuff.
-        val builder = new PraConfigBuilder(baseConfig)
-        builder.setRelation(relation.asString())
-        builder.setOutputBase(logDir + relation.asString() + "/")
-        val relationIndex = graph.getEdgeIndex(relation.asString())
-        val inverseIndex = inverses.getOrElse(relationIndex, -1)
-        val unallowedEdges = if (inverseIndex == -1) Seq(relationIndex) else Seq(relationIndex, inverseIndex)
-        builder.setUnallowedEdges(unallowedEdges)
-        builder.setTrainingData(trainingData)
-        builder.setTestingData(testingData)
-        val config = builder.build()
-        fileUtil.mkdirs(config.outputBase)
-
-        // Now we run the SFE code.
-
-        // The second parameter here is praBase, which we're not using (hopefully passing /dev/null works...)
-        val generator = new SubgraphFeatureGenerator(featureParams, logDir, config)
-        val trainingMatrix = generator.createTrainingMatrix(trainingData)
-
-        val model = PraModelCreator.create(config, modelParams)
-        val featureNames = generator.getFeatureNames()
-        model.train(trainingMatrix, trainingData, featureNames)
-
-        println(s"Scoring ${config.testingData.instances.size} potential predictions")
-        val testMatrix = generator.createTestMatrix(config.testingData)
-        val scores = model.classifyInstances(testMatrix)
-
-        // And here we output the predictions in the format that NELL expects.  Well, we send them to
-        // the TraditionalPredicateConsumer, which keeps track of them.
-        outputPredictions(relation, scores, tpc)
-        // I think I can put this call in multiple times and it won't overwrite anything.  We'll
-        // see...
-        tpc.writeTCF()
-      } else {
-        // Sometimes I really do wish that scala had a continue...  This should just be a continue
-        // up by the original if.
-        println("No training data found, so we're skipping this relation")
-      }
-    })
+    targetRelations.foreach(relation => runRelation(relation, graph, relationInstances,
+      categoryInstances, inverses, domains, ranges, baseConfig, tpc))
 
     // Now that we have output from all of the relations, we create a final NELL TCF file.
     println("Outputting final NELL TCF file")
     tpc.writeTCF()
     println("Done running NellSfeInterfacer")
+  }
+
+  // A whole bunch of ugly parameters, but I needed to have this be its own method, so I could
+  // return early if necessary.  Sorry...  This is one instance where a "continue" in scala would
+  // make my code a lot nicer.  Maybe that means I designed it poorly...
+  def runRelation(
+      relation: RTWValue,
+      graph: Graph,
+      relationInstances: Map[RTWValue, Seq[Instance]],
+      categoryInstances: Map[RTWValue, Set[Int]],
+      inverses: Map[Int, Int],
+      domains: Map[RTWValue, RTWValue],
+      ranges: Map[RTWValue, RTWValue],
+      baseConfig: PraConfig,
+      tpc: TraditionalPredicateConsumer) {
+    println(s"Running relation $relation")
+    val trainingData = loadTrainingData(
+      relation, graph, relationInstances, categoryInstances, domains, ranges)
+    println(s"Training data size: ${trainingData.instances.size}")
+    if (trainingData.instances.size == 0) {
+      println("No training data found, so we're skipping this relation")
+      return
+    }
+    val domain = categoryInstances(domains(relation))
+    val range = categoryInstances(ranges(relation))
+    if (domain.size > 400000) {
+      println("WARNING: relation has more than 400000 concepts in domain; skipping...")
+      return
+    }
+
+    // Relation-specific config stuff.
+    val builder = new PraConfigBuilder(baseConfig)
+    builder.setRelation(relation.asString())
+    builder.setOutputBase(logDir + relation.asString() + "/")
+    val relationIndex = graph.getEdgeIndex(relation.asString())
+    val inverseIndex = inverses.getOrElse(relationIndex, -1)
+    val unallowedEdges = if (inverseIndex == -1) Seq(relationIndex) else Seq(relationIndex, inverseIndex)
+    builder.setUnallowedEdges(unallowedEdges)
+    builder.setTrainingData(trainingData)
+    val config = builder.build()
+    fileUtil.mkdirs(config.outputBase)
+
+    // Now we run the SFE code.
+
+    val generator = new SubgraphFeatureGenerator(featureParams, config)
+    val trainingMatrix = generator.createTrainingMatrix(trainingData)
+
+    val model = BatchModel.create(modelParams, config)
+    val featureNames = generator.getFeatureNames()
+    model.train(trainingMatrix, trainingData, featureNames)
+
+    val knownPositives = new Dataset(relationInstances(relation))
+    // TODO(matt): try a simple BFS here, instead of a PPR computation
+    val params: JValue = ("ppr computer" -> ("walks per source" -> 50) ~ ("log level" -> 4))
+    val negativeExampleSelector = new PprNegativeExampleSelector(params, graph)
+
+    val totalScores = new mutable.ArrayBuffer[(Instance, Double)]
+
+    val numInstances = domain.size
+    val notifyEvery = Math.min(10000, numInstances / 4)
+    val done = new java.util.concurrent.atomic.AtomicInteger(0)
+    println(s"Predicting new instances for the whole domain (${numInstances} concepts)")
+    domain.par.foreach(concept => {
+      val index = done.incrementAndGet()
+      if (index % notifyEvery == 0) Outputter.info(s"Done with $index")
+      val targets = negativeExampleSelector.findPotentialPredictions(concept, range, knownPositives)
+      if (targets.size > 0) {
+        val dataset = new Dataset(targets.map(target => Instance(concept, target, false, graph)).toSeq)
+        val testMatrix = generator.createTestMatrix(dataset)
+        val scores = model.classifyInstances(testMatrix)
+        totalScores.synchronized {
+          totalScores ++= scores
+        }
+      }
+    })
+
+    // And here we output the predictions in the format that NELL expects.  Well, we send them to
+    // the TraditionalPredicateConsumer, which keeps track of them.
+    outputPredictions(relation, totalScores, tpc)
   }
 
   def getTargetRelations(): Seq[RTWValue] = {
@@ -271,12 +305,77 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
 
     val end = compat.Platform.currentTime
     val seconds = (end - start) / 1000.0
-    println(s"Done building graph; took $seconds seconds")
+    println(s"Done reading KB graph; took $seconds seconds")
+
+    val categoryInstances = mutableCategoryInstances.map(entry => {
+      (entry._1, entry._2.map(entityName => builder.nodeDict.getIndex(entityName)).toSet)
+    }).withDefaultValue(Set[Int]()).toMap
+
+    if (svoFile != null) {
+      println(s"Adding SVO edges to graph from file $svoFile")
+      println("Gathering a list of aliases first")
+      val aliasStart = compat.Platform.currentTime
+      val aliasMap = new mutable.HashMap[String, mutable.HashSet[String]]
+      mutableCategoryInstances.foreach(entry => {
+        entry._2.map(entity => {
+          val strings = KbUtility.getLiteralStrings(KbManipulation.gpe(entity), null).asScala
+          for (string <- strings) {
+            aliasMap.getOrElseUpdate(string, new mutable.HashSet[String]).add(entity)
+          }
+        })
+      })
+      val aliases = aliasMap.keySet -- excludedAliases
+      val aliasEnd = compat.Platform.currentTime
+      val aliasSeconds = (aliasEnd - aliasStart) / 1000.0
+      println(s"Took $aliasSeconds seconds")
+      println("Now processing the SVO file")
+      val count = new java.util.concurrent.atomic.AtomicInteger(0)
+      val f: String => Seq[(String, String, String)] = (line: String) => {
+        val index = count.getAndIncrement()
+        fileUtil.logEvery(1000000, index, s"${index}; time so far: " +
+          s"${(compat.Platform.currentTime - aliasEnd) / 1000.0}")
+        val fields = line.split("\t")
+        val s = fields(0)
+        val v = fields(1)
+        val o = fields(2)
+        if (aliases.contains(s) && aliases.contains(o)) {
+          Seq((s, v, o))
+        } else {
+          Seq[(String, String, String)]()
+        }
+      }
+      val svoStart = compat.Platform.currentTime
+      val edges = fileUtil.parFlatMapLinesFromFile(svoFile, f)
+      val svoEnd = compat.Platform.currentTime
+      val numEdges = edges.size  // doing this here to for computation, so the seconds is correct
+      val svoSeconds = (svoEnd - svoStart) / 1000.0
+      println(s"Found ${numEdges} SVO edges for the NELL entities in $svoSeconds seconds; adding them to the graph")
+      val addedAliases = new mutable.HashSet[String]
+      // TODO(matt): it'd be really nice if this were parallelizable...
+      edges.foreach(edge => {
+        val s = edge._1
+        val v = edge._2
+        val o = edge._3
+        // builder.addEdge arguments are (source, target, relation)
+        builder.addEdge(s, o, v)
+        if (!addedAliases.contains(s)) {
+          addedAliases.add(s)
+          for (entity <- aliasMap(s)) {
+            builder.addEdge(entity, s, aliasEdge)
+          }
+        }
+        if (!addedAliases.contains(o)) {
+          addedAliases.add(o)
+          for (entity <- aliasMap(o)) {
+            builder.addEdge(entity, o, aliasEdge)
+          }
+        }
+      })
+      // countAliases(edges)  // this is for seeing if there are any aliases that should be excluded
+    }
+
     println(s"Graph has ${builder.edgesAdded} edges all together")
     val graph = builder.toGraphInMemory
-    val categoryInstances = mutableCategoryInstances.map(entry => {
-      (entry._1, entry._2.map(entityName => graph.getNodeIndex(entityName)).toSet)
-    }).withDefaultValue(Set[Int]()).toMap
     val relationInstances = mutableRelationInstances.map(entry => {
       (entry._1, entry._2.map(pair => {
         val arg1Index = graph.getNodeIndex(pair._1)
@@ -285,6 +384,28 @@ class NellSfeInterfacer(tts: TinkerToyServices, params: JValue, fileUtil: FileUt
       }).toSeq)
     }).withDefaultValue(Seq[Instance]()).toMap
     (graph, relationInstances, categoryInstances)
+  }
+
+  def countAliases(edges: Seq[(String, String, String)]) {
+      val aliasCounts = new mutable.HashMap[String, Int]
+      edges.foreach(edge => {
+        val s = edge._1
+        val v = edge._2
+        val o = edge._3
+        aliasCounts.update(s, aliasCounts.getOrElse(s, 0) + 1)
+        aliasCounts.update(o, aliasCounts.getOrElse(o, 0) + 1)
+      })
+      val numToTake = 1000
+      val topAliases = aliasCounts.map(entry => (-entry._2, entry._1)).toSeq.sorted.take(numToTake)
+      println("Top aliases:")
+      var totalCount = 0
+      for (topAlias <- topAliases) {
+        val count = topAlias._1
+        val alias = topAlias._2
+        println(s"${alias}: $count")
+        totalCount += count
+      }
+      println(s"Total count in top ${numToTake}: $totalCount")
   }
 
   def addValueToArrayMap[T](
